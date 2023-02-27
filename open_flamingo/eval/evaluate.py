@@ -20,6 +20,12 @@ from open_flamingo.eval.imagenet_utils import openai_imagenet_classnames, \
 from open_flamingo.src.factory import create_model_and_transforms
 from open_flamingo.src.flamingo import Flamingo
 
+from open_flamingo.train.distributed import init_distributed_device, world_info_from_env
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import random
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--lm_path", type=str, default="facebook/opt-1.3b")
 parser.add_argument("--lm_tokenizer_path", type=str,
@@ -64,7 +70,28 @@ parser.add_argument("--eval_imagenet", action="store_true", default=False,
 
 parser.add_argument("--eval_flickr30", action="store_true", default=False,
                     help="Whether to evaluate on Flickr30.")
-
+# distributed eval args
+parser.add_argument(
+    "--dist-url",
+    default="env://",
+    type=str,
+    help="url used to set up distributed training",
+)
+parser.add_argument(
+    "--dist-backend", default="nccl", type=str, help="distributed backend"
+)
+parser.add_argument(
+    "--horovod",
+    default=False,
+    action="store_true",
+    help="Use horovod for distributed training.",
+)
+parser.add_argument(
+    "--no-set-device-rank",
+    default=False,
+    action="store_true",
+    help="Don't set device index from local rank (when CUDA_VISIBLE_DEVICES restricted to one per proc).",
+)
 # Dataset arguments
 
 ## COCO Dataset
@@ -121,11 +148,21 @@ parser.add_argument("--imagenet_root",
                     default="/tmp")
 
 
+def random_seed(seed=42, rank=0):
+    torch.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
+    random.seed(seed + rank)
+
 def main():
     args = parser.parse_args()
 
+    # distributed eval setup
+    args.local_rank, args.rank, args.world_size = world_info_from_env()
+    device_id = init_distributed_device(args)
+    print(f"Start running eval on rank {args.rank}.")
+
     # load model
-    flamingo, image_processor, tokenizer = create_model_and_transforms(
+    model, image_processor, tokenizer = create_model_and_transforms(
         args.clip_path,
         args.clip_path,
         args.lm_path,
@@ -137,9 +174,13 @@ def main():
     ]
     # remove the "module." prefix from the keys
     checkpoint = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+    model.load_state_dict(checkpoint, strict=False)
 
-    flamingo.load_state_dict(checkpoint, strict=False)
-    flamingo.to(args.device if args.device >= 0 else "cpu")
+    # more distributed setup
+    device_id = args.rank % torch.cuda.device_count()
+    model = model.to(device_id)
+    ddp_model = DDP(model, device_ids=[device_id])
+    ddp_model.eval()
 
     results = defaultdict(list)
 
@@ -149,23 +190,27 @@ def main():
             scores = []
             for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
                 cider_score = evaluate_coco_flickr(
-                    model=flamingo,
+                    model=ddp_model,
                     tokenizer=tokenizer,
                     image_processor=image_processor,
+                    args=args,
                     batch_size=args.batch_size,
                     image_dir_path=args.flickr_image_dir_path,
                     annotations_json_path=args.flickr_annotations_json_path,
                     num_samples=args.num_samples,
                     num_shots=shot,
-                    device=args.device,
+                    device=device_id,
                     seed=seed,
                     is_flickr=True
                 )
-                print(f"Shots {shot} Trial {trial} CIDEr score: {cider_score}")
-                scores.append(cider_score)
-            print(f"Shots {shot} Mean CIDEr score: {np.mean(scores)}")
-            results["flickr30"].append(
-                {"shots": shot, "trials": scores, "mean": np.mean(scores)})
+                if args.rank == 0: 
+                    print(f"Shots {shot} Trial {trial} CIDEr score: {cider_score}")
+                    scores.append(cider_score)
+            
+            if args.rank == 0:
+                print(f"Shots {shot} Mean CIDEr score: {np.mean(scores)}")
+                results["flickr30"].append(
+                    {"shots": shot, "trials": scores, "mean": np.mean(scores)})
     results = defaultdict(list)
 
     if args.eval_coco:
@@ -174,23 +219,29 @@ def main():
         for shot in args.shots:
             scores = []
             for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
+
+                random_seed(int(seed), int(args.rank))
+
                 cider_score = evaluate_coco_flickr(
-                    model=flamingo,
+                    model=ddp_model,
                     tokenizer=tokenizer,
                     image_processor=image_processor,
+                    args=args,
                     batch_size=args.batch_size,
                     image_dir_path=args.coco_image_dir_path,
                     annotations_json_path=args.coco_annotations_json_path,
                     num_samples=args.num_samples,
                     num_shots=shot,
-                    device=args.device,
+                    device=device_id,
                     seed=seed,
                 )
-                print(f"Shots {shot} Trial {trial} CIDEr score: {cider_score}")
-                scores.append(cider_score)
-            print(f"Shots {shot} Mean CIDEr score: {np.mean(scores)}")
-            results["coco"].append(
-                {"shots": shot, "trials": scores, "mean": np.mean(scores)})
+                if args.rank == 0: 
+                    print(f"Shots {shot} Trial {trial} CIDEr score: {cider_score}")
+                    scores.append(cider_score)
+            if args.rank == 0: 
+                print(f"Shots {shot} Mean CIDEr score: {np.mean(scores)}")
+                results["coco"].append(
+                    {"shots": shot, "trials": scores, "mean": np.mean(scores)})
 
     if args.eval_vqav2:
 
@@ -199,7 +250,7 @@ def main():
             scores = []
             for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
                 vqa_score = evaluate_vqa(
-                    model=flamingo,
+                    model=ddp_model,
                     tokenizer=tokenizer,
                     image_processor=image_processor,
                     batch_size=args.batch_size,
@@ -224,7 +275,7 @@ def main():
             scores = []
             for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
                 imagenet_score = evaluate_imagenet(
-                    model=flamingo,
+                    model=ddp_model,
                     tokenizer=tokenizer,
                     image_processor=image_processor,
                     batch_size=args.batch_size,
@@ -253,7 +304,6 @@ def get_random_indices(num_samples, effective_num_shots, full_dataset, seed):
         )
 
     # get a random subset of the dataset
-    np.random.seed(seed)
     random_indices = np.random.choice(
         len(full_dataset), num_samples + effective_num_shots, replace=False
     )
@@ -318,11 +368,10 @@ def prepare_batch_images(batch, image_processor, context_images,
 def get_outputs(model, batch_images, device, attention_mask,
                 max_generation_length, num_beams, length_penalty, input_ids):
     with torch.inference_mode():
-        outputs = model.generate(
-            batch_images.to(device if device >= 0 else "cpu"),
-            input_ids.to(device if device >= 0 else "cpu"),
-            attention_mask=attention_mask.to(
-                device if device >= 0 else "cpu"),
+        outputs = model.module.generate(
+            batch_images.to(device),
+            input_ids.to(device),
+            attention_mask=attention_mask.to(device),
             max_new_tokens=max_generation_length,
             num_beams=num_beams,
             length_penalty=length_penalty,
@@ -336,6 +385,7 @@ def evaluate_coco_flickr(
         model,
         tokenizer,
         image_processor,
+        args,
         batch_size,
         image_dir_path,
         annotations_json_path,
@@ -388,8 +438,6 @@ def evaluate_coco_flickr(
                                         in_context_samples=in_context_samples,
                                         num_shots=num_shots)
 
-    model.eval()
-
     def get_prompt(sample):
         return f"<image>Output:{sample['caption'].strip()}<|endofchunk|>"
 
@@ -398,13 +446,11 @@ def evaluate_coco_flickr(
                                     effective_num_shots=effective_num_shots,
                                     num_shots=num_shots)
 
-    predictions = defaultdict()
+    predictions = defaultdict(list)
 
     desc = 'Running inference Flickr30' if is_flickr else 'Running inference COCO'
 
-    for batch in more_itertools.chunked(
-            tqdm(eval_dataset, desc=desc), batch_size
-    ):
+    for batch in more_itertools.chunked(eval_dataset, batch_size):
         batch_images = prepare_batch_images(batch=batch,
                                             image_processor=image_processor,
                                             context_images=context_images,
@@ -437,34 +483,42 @@ def evaluate_coco_flickr(
         ]
 
         for i, sample in enumerate(batch):
-            predictions[sample["image_id"]] = {
-                "caption": new_predictions[i],
-            }
+            predictions["image_id"].append(sample["image_id"])
+            predictions["caption"].append(new_predictions[i])
+            # predictions[sample["image_id"]] = {
+            #     "caption": new_predictions[i],
+            # }
 
-    # save the predictions to a temporary file
-    random_uuid = str(uuid.uuid4())
-    results_path = f"flickrresults_{random_uuid}.json" if is_flickr \
-        else f"cocoresults_{random_uuid}.json"
-    with open(results_path, "w") as f:
-        f.write(
-            json.dumps(
-                [
-                    {"image_id": k, "caption": predictions[k]["caption"]}
-                    for k in predictions
-                ],
-                indent=4,
+    outputs = [None for _ in range(args.world_size)]
+    dist.all_gather_object(outputs, predictions)
+
+    if args.rank == 0: 
+
+        print(outputs)
+
+        # save the predictions to a temporary file
+        random_uuid = str(uuid.uuid4())
+        results_path = f"flickrresults_{random_uuid}.json" if is_flickr \
+            else f"cocoresults_{random_uuid}.json"
+        with open(results_path, "w") as f:
+            f.write(
+                json.dumps(
+                    [
+                        {"image_id": k, "caption": outputs["caption"][i]}
+                        for i, k in enumerate(outputs["image_id"])
+                    ],
+                    indent=4,
+                )
             )
+
+        metrics = compute_cider(
+            result_path=results_path,
+            annotations_path=annotations_json_path,
         )
 
-    metrics = compute_cider(
-        result_path=results_path,
-        annotations_path=annotations_json_path,
-    )
-
-    # delete the temporary file
-    os.remove(results_path)
-
-    return metrics["CIDEr"] * 100.0
+        # delete the temporary file
+        os.remove(results_path)
+        return metrics["CIDEr"] * 100.0
 
 
 def evaluate_vqa(
@@ -530,7 +584,6 @@ def evaluate_vqa(
         full_dataset=full_dataset, random_indices=random_indices,
         effective_num_shots=effective_num_shots)
 
-    model.eval()
     predictions = []
 
     context_images = get_context_images(image_processor=image_processor,
@@ -661,7 +714,6 @@ def evaluate_imagenet(
         full_dataset=full_dataset, random_indices=random_indices,
         effective_num_shots=effective_num_shots)
 
-    model.eval()
     # Predictions based on the class target sequence with the maximal predicted probability
     predictions_max_prob = []
     # Predictions based on the class target sequence with the minimal loss on the model logits

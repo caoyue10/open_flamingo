@@ -19,12 +19,10 @@ from transformers import (
 
 from open_flamingo import create_model_and_transforms
 
-
 def random_seed(seed=42, rank=0):
     torch.manual_seed(seed + rank)
     np.random.seed(seed + rank)
     random.seed(seed + rank)
-
 
 def main():
     parser = argparse.ArgumentParser()
