@@ -187,10 +187,11 @@ def main():
         args.lm_path,
         args.tokenizer_path if args.tokenizer_path else args.lm_path,
         use_local_files=args.offline,
+        use_projection_vector=True,
+        vis_dim=768,
         use_media_placement_augmentation=args.use_media_placement_augmentation,
     )
-    
-    assert model.use_projection_vector is False, "projection vector not desired"
+    # assert model.use_projection_vector is False, "projection vector not desired"
 
     random_seed(args.seed, args.rank)
 
