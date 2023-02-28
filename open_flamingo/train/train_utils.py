@@ -30,6 +30,7 @@ def train_one_epoch(
     model,
     epoch,
     laion_loader,
+    c4_loader,
     pile_loader,
     tokenizer,
     optimizer,
@@ -40,12 +41,14 @@ def train_one_epoch(
 ):
     num_batches_per_epoch_laion = laion_loader.num_batches
     num_batches_per_epoch_pile = pile_loader.num_batches
+    num_batches_per_epoch_c4 = c4_loader.num_batches
 
     print(f"Number of batches per epoch in laion: {num_batches_per_epoch_laion}")
     print(f"Number of batches per epoch in pile: {num_batches_per_epoch_pile}")
+    print(f"Number of batches per epoch in c4: {num_batches_per_epoch_c4}")
 
     # assert num_batches_per_epoch_laion == num_batches_per_epoch_pile, "Number of batches in laion and pile datasets must be the same"
-    num_batches_per_epoch = num_batches_per_epoch_pile
+    num_batches_per_epoch = num_batches_per_epoch_c4
 
     print(f"Number of batches per epoch: {num_batches_per_epoch}")
 
@@ -67,8 +70,8 @@ def train_one_epoch(
     num_collisions = 0
 
     # loop through dataloader
-    for num_steps, (batch_laion, batch_pile) in tqdm(
-        enumerate(zip(laion_loader, pile_loader)), disable=args.rank != 0
+    for num_steps, (batch_laion, batch_c4, batch_pile) in tqdm(
+        enumerate(zip(laion_loader, c4_loader, pile_loader)), disable=args.rank != 0
     ):
         data_time_m.update(time.time() - end) 
 
@@ -103,10 +106,10 @@ def train_one_epoch(
         divided_loss_laion = loss_laion / args.gradient_accumulation_steps
 
         #### C4 FORWARD PASS ####
-        images = batch_pile[0].to(device_id, dtype=cast_dtype, non_blocking=True).unsqueeze(2)
-        input_ids = torch.stack([x[0] for x in batch_pile[1]]).squeeze(1)
-        attention_mask = torch.stack([x[1] for x in batch_pile[1]]).squeeze(1)
-        urls = batch_pile[2]
+        images = batch_c4[0].to(device_id, dtype=cast_dtype, non_blocking=True).unsqueeze(2)
+        input_ids = torch.stack([x[0] for x in batch_c4[1]]).squeeze(1)
+        attention_mask = torch.stack([x[1] for x in batch_c4[1]]).squeeze(1)
+        urls = batch_c4[2]
         
         # add urls to bloom filter if not already present
         for url in urls:
@@ -137,13 +140,11 @@ def train_one_epoch(
                     labels[i][token_idx] = -100
                     token_idx += 1
 
-        # print("labels: ", labels[0])
-
         labels[labels == media_token_id] = -100
         labels.to(device_id)
 
         with autocast():
-            loss_pile = model(
+            loss_c4 = model(
                 vision_x=images,
                 lang_x=input_ids,
                 attention_mask=attention_mask,
@@ -151,7 +152,7 @@ def train_one_epoch(
             )[0]
             
             # if loss is nan, skip this batch
-            if torch.isnan(loss_pile):
+            if torch.isnan(loss_c4):
                 print("loss is nan, skipping this batch")
                 print("input_ids: ", tokenizer.batch_decode(input_ids))
                 print("labels: ", labels)
@@ -159,11 +160,50 @@ def train_one_epoch(
                 optimizer.zero_grad()
                 continue
             
+        divided_loss_c4 = loss_c4 / args.gradient_accumulation_steps
+
+        #### PILE FORWARD PASS ####
+        input_ids = torch.stack([x[0] for x in batch_pile[1]]).squeeze(1)
+        attention_mask = torch.stack([x[1] for x in batch_pile[1]]).squeeze(1)
+        clip_text_input_ids = torch.stack([x[0] for x in batch_pile[0]]).to(
+            device_id, dtype=cast_dtype, non_blocking=True
+        )
+        clip_text_attention_mask = torch.stack([x[1] for x in batch_pile[0]]).to(
+            device_id, dtype=cast_dtype, non_blocking=True
+        )
+        # NOTE: irena: expected shape of clip_text_input_ids / attention_mask is (N, I, max_seq_len)
+
+        labels = input_ids.clone()
+        labels[labels == tokenizer.pad_token_id] = -100
+        labels[:, 0] = -100
+
+        # remove loss for any token before the first <image> token
+        for i in range(labels.shape[0]):
+            label_idx = 0
+            while (
+                label_idx < labels.shape[1] and labels[i][label_idx] != media_token_id
+            ):
+                labels[i][label_idx] = -100
+                label_idx += 1
+
+        labels[labels == media_token_id] = -100
+        labels.to(device_id)
+
+        with autocast():
+            loss_pile = model(
+                None,
+                input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                pseudovision_x=clip_text_input_ids,
+                pseudovision_attention_mask=clip_text_attention_mask,
+            )[0]
         divided_loss_pile = loss_pile / args.gradient_accumulation_steps
 
         #### BACKWARD PASS ####
         loss = (
             divided_loss_laion * args.loss_multiplier_laion
+            + divided_loss_c4 * args.loss_multiplier_c4
             + divided_loss_pile * args.loss_multiplier_pile
         )
         loss.backward()
@@ -203,6 +243,9 @@ def train_one_epoch(
                 c4_samples_per_second = args.gradient_accumulation_steps * args.batch_size_c4 * args.world_size / step_time_m.val
                 c4_samples_per_second_per_gpu = args.gradient_accumulation_steps * args.batch_size_c4 / step_time_m.val
 
+                pile_samples_per_second = args.gradient_accumulation_steps * args.batch_size_pile * args.world_size / step_time_m.val
+                pile_samples_per_second_per_gpu = args.gradient_accumulation_steps * args.batch_size_pile / step_time_m.val
+
                 wandb.log(
                     {
                         "data_time": data_time_m.avg,
@@ -211,6 +254,8 @@ def train_one_epoch(
                         "laion_samples_per_second_per_gpu": laion_samples_per_second_per_gpu,
                         "c4_samples_per_second": c4_samples_per_second,
                         "c4_samples_per_second_per_gpu": c4_samples_per_second_per_gpu,
+                        "pile_samples_per_second": pile_samples_per_second,
+                        "pile_samples_per_second_per_gpu": pile_samples_per_second_per_gpu,
                         "lr": optimizer.param_groups[0]['lr'], 
                     }, 
                     commit=False,
@@ -227,6 +272,10 @@ def train_one_epoch(
                         "loss_laion": divided_loss_laion.item(),
                         "global_step": global_step,
                     },
+                    commit=False,
+                )
+                wandb.log(
+                    {"loss_c4": divided_loss_c4.item(), "global_step": global_step},
                     commit=False,
                 )
                 wandb.log(

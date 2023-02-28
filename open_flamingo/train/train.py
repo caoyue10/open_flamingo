@@ -60,6 +60,7 @@ def main():
     # Sum of gradient optimization batch size
     parser.add_argument("--batch_size_c4", type=int, default=128)
     parser.add_argument("--batch_size_laion", type=int, default=128)
+    parser.add_argument("--batch_size_pile", type=int, default=128)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument(
@@ -77,10 +78,16 @@ def main():
         type=str,
         default="/mmfs1/gscratch/efml/anasa2/data/c4/c4-interleaved-shard-{000000..000100}.tar",
     )
+    parser.add_argument(
+        "--pile_shards",
+        type=str,
+        default="/fsx/home-anasawadalla/pile/shard-{000000..000169}.tar",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--lr_scheduler", default="constant", type=str)
     parser.add_argument("--loss_multiplier_pile", type=float, default=1.0)
+    parser.add_argument("--loss_multiplier_c4", type=float, default=1.0)
     parser.add_argument("--loss_multiplier_laion", type=float, default=1.0)
     parser.add_argument("--warmup_steps", default=5000, type=int)
     parser.add_argument("--weight_decay", default=0.1, type=float)
@@ -93,6 +100,7 @@ def main():
     # data args
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--train_num_samples_c4", type=int, default=10000)
+    parser.add_argument("--train_num_samples_pile", type=int, default=10000)
     parser.add_argument("--train_num_samples_laion", type=int, default=10000)
     parser.add_argument("--dataset_resampled", action="store_true")
     # distributed training args
@@ -156,6 +164,9 @@ def main():
 
     assert (args.train_num_samples_laion // args.batch_size_laion) == (
         args.train_num_samples_c4 // args.batch_size_c4
+    ), "number of samples per epoch must be equal for c4 and laion"
+    assert (args.train_num_samples_laion // args.batch_size_laion) == (
+        args.train_num_samples_pile // args.batch_size_pile
     ), "number of samples per epoch must be equal for pile and laion"
 
     if args.offline:
@@ -198,12 +209,21 @@ def main():
 
     ddp_model = DDP(model, device_ids=[device_id])
 
+    ## LAION DATASET ##
     args.shards = list(braceexpand.braceexpand(args.laion_shards))
     args.dataset_type = "image_text"
     args.batch_size = args.batch_size_laion
     args.train_num_samples = args.train_num_samples_laion
     laion_dataset = get_data(args, image_processor, tokenizer)
 
+    ## PILE DATSET ##
+    args.shards = args.pile_shards
+    args.dataset_type = "pile"
+    args.batch_size = args.batch_size_pile
+    args.train_num_samples = args.train_num_samples_pile
+    pile_dataset = get_data(args, image_processor, tokenizer)
+
+    ## C4 DATASET ##
     c4_shard_urls = []
     with open("/fsx/home-anasawadalla/shard_url_list.txt", "r") as f:
         for idx, line in enumerate(f):
@@ -221,7 +241,7 @@ def main():
     args.dataset_type = "c4"
     args.batch_size = args.batch_size_c4
     args.train_num_samples = args.train_num_samples_c4
-    pile_dataset = get_data(args, image_processor, tokenizer)
+    c4_dataset = get_data(args, image_processor, tokenizer)
 
     def get_grouped_params(model):
         params_with_wd, params_without_wd = [], []
@@ -296,6 +316,8 @@ def main():
     for epoch in range(resume_from_epoch, args.num_epochs):
         laion_dataset.set_epoch(epoch)
         laion_loader = laion_dataset.dataloader
+        c4_dataset.set_epoch(epoch)
+        c4_loader = c4_dataset.dataloader
         pile_dataset.set_epoch(epoch)
         pile_loader = pile_dataset.dataloader
 
@@ -307,6 +329,7 @@ def main():
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
             laion_loader=laion_loader,
+            c4_loader=c4_loader,
             pile_loader=pile_loader,
             device_id=device_id,
             wandb=wandb,
