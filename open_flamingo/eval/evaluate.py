@@ -747,8 +747,10 @@ def evaluate_imagenet(
                         'padding': True,
                         'truncation': True,
                         'max_length': 256}
-
-    for i, batch in enumerate(more_itertools.chunked(eval_dataset, batch_size)):
+    device_count = torch.cuda.device_count()
+    model = torch.nn.DataParallel(model)
+    for i, batch in enumerate(more_itertools.chunked(eval_dataset,
+                                                     batch_size * device_count)):
         print(f"processing batch {i} of {ceil(len(eval_dataset) / batch_size)}")
         batch_per_class_probs = []
         batch_per_class_losses = []
