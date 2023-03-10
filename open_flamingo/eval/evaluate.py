@@ -757,6 +757,8 @@ def evaluate_imagenet(
                                             context_images=context_images,
                                             num_shots=num_shots)
 
+        import ipdb;ipdb.set_trace()
+
         # Process the images only once.
         batch_images = batch_images.to(device)
         model._process_media(vision_x=batch_images)
